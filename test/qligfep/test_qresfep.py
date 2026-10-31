@@ -262,6 +262,79 @@ class TestProteinComplexCoordinates:
         assert set(run.pdb) == {1}
 
 
+_LEU1 = (
+    "ATOM      1  N   LEU A   1       0.000   0.000   0.000  1.00  0.00           N\n"
+    "ATOM      2  CA  LEU A   1       1.450   0.000   0.000  1.00  0.00           C\n"
+    "ATOM      3  C   LEU A   1       2.000   1.400   0.000  1.00  0.00           C\n"
+    "ATOM      4  O   LEU A   1       1.400   2.400   0.000  1.00  0.00           O\n"
+    "ATOM      5  CB  LEU A   1       1.900  -0.800   1.200  1.00  0.00           C\n"
+)
+# The cofactor as qparams writes it, and as qprep_prot -cof appends it (other serial and residue number)
+_LIG_COFACTOR_FILE = "HETATM    1 C1   LIG     1       8.000   8.000   8.000  0.00  0.00           C  \n"
+_LIG_IN_PREPARED_PDB = "HETATM    6  C1  LIG A   2       8.000   8.000   8.000  1.00  0.00           C\n"
+
+
+class TestCofactorsInTheComplex:
+    @staticmethod
+    def _run(tmp_path, protein_text):
+        protein = tmp_path / "protein_processed.pdb"
+        protein.write_text(protein_text)
+        (tmp_path / "ALA1.pdb").write_text(_LEU1.replace("LEU", "ALA"))
+        (tmp_path / "LIG.pdb").write_text(_LIG_COFACTOR_FILE)
+        run = QresFEP(
+            mutation="LEU1ALA",
+            chain="A",
+            system="protein",
+            force_field="OPLSAAM",
+            cluster="SNELLIUS",
+            cofactors=["LIG"],
+            workdir=tmp_path,
+        )
+        run.protein_pdb = protein
+        run.q_position = 1
+        return run
+
+    @staticmethod
+    def _lig_atoms(run):
+        return [atom for residue in run.pdb.values() for atom in residue if atom[4] == "LIG"]
+
+    def test_a_cofactor_already_written_by_qprep_prot_is_not_added_again(self, tmp_path):
+        run = self._run(tmp_path, _LEU1 + _LIG_IN_PREPARED_PDB)
+
+        run.read_pdb()
+
+        assert len(self._lig_atoms(run)) == 1
+
+    def test_a_cofactor_missing_from_the_prepared_pdb_is_appended(self, tmp_path):
+        run = self._run(tmp_path, _LEU1)
+
+        run.read_pdb()
+
+        assert len(self._lig_atoms(run)) == 1
+
+    def test_the_zero_force_pass_reads_the_cofactor_libraries(self, tmp_path, monkeypatch):
+        """Without them qprep stops at the cofactor before reporting the hybrid's missing terms."""
+        run = self._run(tmp_path, _LEU1 + _LIG_IN_PREPARED_PDB)
+        run.read_pdb()
+        (tmp_path / "LIG.prm").write_text(
+            "[options]\n[atom_types]\n[bonds]\n[angles]\n[torsions]\n[impropers]\n"
+        )
+        run.inputfiles.mkdir(parents=True)
+        run.hybrid_lib_name, run.ff_lib_name = "L2A.lib", "OPLSAAM.lib"
+        run.center, run.radius = [0.0, 0.0, 0.0], 25.0
+        seen = {}
+
+        def fake_qprep(input_file, output_file, check=True):
+            seen[input_file] = (run.inputfiles / input_file).read_text()
+            (run.inputfiles / output_file).write_text("")
+
+        monkeypatch.setattr(run, "_run_qprep", fake_qprep)
+
+        run.find_missing_bonded()
+
+        assert "rl LIG.lib" in seen["tmp.inp"].splitlines()
+
+
 class TestForceFieldSupport:
     def test_non_oplsaam_force_fields_are_rejected(self, tmp_path):
         with pytest.raises(MutationError, match="currently supports only OPLSAAM"):

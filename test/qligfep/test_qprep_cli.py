@@ -1,12 +1,14 @@
 """Tests for the QligFEP.CLI.qprep_cli module."""
 
 import argparse
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
 import pytest
 
-from QligFEP.CLI.qprep_cli import Neutralizer, parse_arguments
+from QligFEP.CLI.qprep_cli import Neutralizer, merge_cofactor_parameters, parse_arguments
+from QligFEP.IO import get_force_field_paths
 
 
 def _make_atom(record_type, serial, atom_name, residue_name, chain, resnum, x, y, z, element="C"):
@@ -933,3 +935,40 @@ class TestNeutralizerInsertionCode:
         assert sorted(nme_out["atom_name"]) == ["C", "H", "H1", "H2", "H3", "N"]
         glu_out = out[(out["insertion_code"] == "") & (out["residue_name"].isin(["GLU", "GLH"]))]
         assert (glu_out["residue_name"] == "GLH").all(), "GLU outside boundary should be neutralized to GLH"
+
+
+class TestCofactorParameters:
+    """`qprep_prot -cof` appends the cofactor, so qprep must also read its library and parameters."""
+
+    @staticmethod
+    def _write_cofactor(directory):
+        (directory / "LIG.pdb").write_text(
+            "HETATM    1 C1   LIG     1       0.000   0.000   0.000  1.00  0.00           C\n"
+        )
+        (directory / "LIG.lib").write_text("{LIG}\n    [atoms]\n        1 C1   c1   0.000\n")
+        (directory / "LIG.prm").write_text(
+            "[options]\n\n[atom_types]\nc1   1.901  0.0  0.121  1.901  0.06028  12.01\n"
+            "[bonds]\n[angles]\n[torsions]\n[impropers]\n"
+        )
+
+    def test_merged_files_hold_the_force_field_and_the_cofactor(self, tmp_path):
+        self._write_cofactor(tmp_path)
+        lib, prm = get_force_field_paths("OPLSAAM")
+
+        merged_lib, merged_prm = merge_cofactor_parameters(tmp_path, ["LIG.pdb"], lib, prm)
+
+        lib_text = Path(merged_lib).read_text()
+        assert "{LIG}" in lib_text and "{ALA}" in lib_text
+        prm_lines = Path(merged_prm).read_text().splitlines()
+        assert prm_lines[0] == "[options]"
+        assert any(line.split()[:1] == ["vdw_rule"] for line in prm_lines)  # force-field options kept
+        assert any(line.split()[:1] == ["c1"] for line in prm_lines)  # cofactor atom type added
+
+    def test_a_cofactor_without_parameters_stops_the_preparation(self, tmp_path):
+        self._write_cofactor(tmp_path)
+        (tmp_path / "LIG.prm").unlink()
+        lib, prm = get_force_field_paths("OPLSAAM")
+
+        with pytest.raises(FileNotFoundError, match="LIG.prm"):
+            merge_cofactor_parameters(tmp_path, ["LIG.pdb"], lib, prm)
+
