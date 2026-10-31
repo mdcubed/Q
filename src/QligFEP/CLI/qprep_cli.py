@@ -14,6 +14,7 @@ from ..IO import (
     parse_lib,
     parse_prm_options,
     parse_qprep_total_charge,
+    read_prm,
     run_qprep,
 )
 from ..logger import logger, setup_logger
@@ -928,6 +929,38 @@ class Neutralizer:
                     logger.debug(f"    Atoms removed: {', '.join(mod_info['atoms_removed'])}")
 
 
+def merge_cofactor_parameters(
+    cwd: Path, cofactors: Sequence[str], ff_lib_path: str, ff_prm_path: str
+) -> tuple[str, str]:
+    """Merge each cofactor's ``.lib``/``.prm`` (beside its ``.pdb``) into the force field's.
+
+    qprep only reads one library and one parameter file, and without the cofactor's entries it
+    rejects the appended residue as "of unknown type".
+
+    Returns:
+        Paths of the merged library and parameter file written to ``cwd``.
+    """
+    libraries, parameter_files = [Path(ff_lib_path)], [Path(ff_prm_path)]
+    for cofactor in cofactors:
+        stem = (cwd / cofactor).with_suffix("")
+        for suffix, files in ((".lib", libraries), (".prm", parameter_files)):
+            path = stem.with_suffix(suffix)
+            if not path.exists():
+                raise FileNotFoundError(f"Cofactor {cofactor} needs {path.name} beside it")
+            files.append(path)
+    merged_lib = cwd / "qprep_cofactors.lib"
+    merged_lib.write_text("".join(path.read_text().rstrip("\n") + "\n" for path in libraries))
+    merged_prm = cwd / "qprep_cofactors.prm"
+    with merged_prm.open("w") as out:
+        for section, lines in read_prm([str(path) for path in parameter_files]).items():
+            out.write(f"{section}\n")
+            out.writelines(lines)
+    logger.info(
+        f"qprep reads {merged_lib.name}/{merged_prm.name}: force field + {len(cofactors)} cofactor(s)"
+    )
+    return str(merged_lib), str(merged_prm)
+
+
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -1141,6 +1174,7 @@ def main(
         for cofactor in args.cofactors:
             pdb_data = append_pdb_to_another(pdb_data, cwd / cofactor, ignore_waters=True)
         processing_steps.append("added cofactors")
+        ff_lib_path, ff_prm_path = merge_cofactor_parameters(cwd, args.cofactors, ff_lib_path, ff_prm_path)
 
     # Step 3: Neutralization
     neutralization_stats = None

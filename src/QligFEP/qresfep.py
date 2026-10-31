@@ -89,6 +89,16 @@ _SOLVENT_RESIDUES = frozenset({"HOH", "SOL", "WAT"})
 #: Parameter-file sections copied into both the temporary and final merged files.
 _PARAMETER_SECTIONS = ("[options]", "[atom_types]", "[bonds]", "[angles]", "[torsions]", "[impropers]")
 
+
+def _atom_keys(pdb_path: Path) -> list[tuple]:
+    """(residue name, x, y, z) of every atom, coordinates rounded to 0.01 A, to recognise a copy."""
+    return [
+        (line[17:21].strip(), *(round(float(line[i : i + 8]), 2) for i in (30, 38, 46)))
+        for line in pdb_path.read_text().splitlines()
+        if line.startswith(("ATOM", "HETATM"))
+    ]
+
+
 #: Local profiles cannot run the two chained FEP stages.
 _LOCAL_CLUSTERS = frozenset({"LOCAL", "LOCALP"})
 
@@ -414,7 +424,17 @@ class QresFEP:
                 "wild-type backbone."
             )
 
-        pdb_files = [self.protein_pdb] + [self.workdir / f"{c}.pdb" for c in self.cofactors]
+        # `qprep_prot -cof` already writes the cofactors into the prepared PDB; appending them
+        # again would put two overlapping copies in the topology.
+        present = set(_atom_keys(self.protein_pdb))
+        pdb_files = [self.protein_pdb]
+        for cofactor in self.cofactors:
+            cofactor_pdb = self.workdir / f"{cofactor}.pdb"
+            atoms = _atom_keys(cofactor_pdb)
+            if atoms and all(atom in present for atom in atoms):
+                logger.info(f"Cofactor {cofactor} is already in {self.protein_pdb.name}; not adding it twice")
+            else:
+                pdb_files.append(cofactor_pdb)
         serial = itertools.count(1)
         residue_counter = itertools.count(1)
         residue_numbers: dict[tuple, int] = {}
@@ -576,6 +596,9 @@ class QresFEP:
                 [
                     f"rl {self.hybrid_lib_name}",
                     f"rl {self.ff_lib_name}",
+                    # tmp.pdb holds the cofactors too; without their libraries qprep stops at them
+                    # before it reports the hybrid's missing terms.
+                    *[f"rl {cofactor}.lib" for cofactor in self.cofactors],
                     "rprm tmp.prm",
                     "rp tmp.pdb",
                     f"boundary 1 {' '.join(str(c) for c in self.center)} {self.radius}",
