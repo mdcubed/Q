@@ -4298,6 +4298,8 @@ subroutine md_run
   real(8)                         :: min_grms, min_E_last, min_alpha
   real(8)                         :: dx, max_disp, fmax, fi
   logical                         :: min_converged
+  logical                         :: freeze_excl
+  character(len=8)                :: freeze_env
   parameter (max_disp = 0.1d0)   ! maximum displacement per coordinate per step (Angstrom)
   parameter (fmax = 1000.0d0)    ! maximum force per component for force capping (kcal/mol/A)
 
@@ -4334,6 +4336,17 @@ subroutine md_run
 
   !Define number of coord to send/receive
   nat3=natom*3
+
+  ! Excluded atoms are held fixed unless Q_INTEGRATE_EXCLUDED=1 (see the integration step)
+  call get_environment_variable('Q_INTEGRATE_EXCLUDED', freeze_env)
+  freeze_excl = (.not. use_PBC) .and. (trim(freeze_env) /= '1')
+  if (nodeid .eq. 0 .and. .not. use_PBC) then
+    if (freeze_excl) then
+      write(*,'(a)') 'Excluded atoms frozen (Q_INTEGRATE_EXCLUDED=1 integrates them as before)'
+    else
+      write(*,'(a)') 'Excluded atoms integrated (Q_INTEGRATE_EXCLUDED=1)'
+    end if
+  end if
 
   ! calculate maximum temperature
   !**Martin Nervall-> Only master calc. temp for now.
@@ -4687,6 +4700,20 @@ subroutine md_run
 #if defined (PROFILING)
       profile(11)%time = profile(11)%time + rtime() - start_loop_time1
 #endif
+
+      ! Keep excluded atoms (outside the SBC sphere) fixed. Integrated, they are never
+      ! thermostatted (Tscale comes from the free atoms only), so heat leaking in through bonded
+      ! terms accumulates until SHAKE fails far outside the sphere in long runs.
+      ! excl(:) is all .false. under PBC. Q_INTEGRATE_EXCLUDED=1 restores the previous behaviour.
+      if (freeze_excl) then
+        do i=1,nat_pro
+          if (excl(i)) then
+            i3=i*3-3
+            x(i3+1:i3+3) = xx(i3+1:i3+3)
+            v(i3+1:i3+3) = 0.0
+          end if
+        end do
+      end if
 
       ! shake if necessary
       if(shake_constraints > 0) then
