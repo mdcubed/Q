@@ -143,7 +143,9 @@ idx=\$(( OMPI_COMM_WORLD_RANK + 1 + \${BATCH_OFFSET:-0} ))
 line=\$(sed -n "\${idx}p" switch_list.txt)
 [ -z "\$line" ] && exit 0
 set -- \$line
-$qdyn "\$1" > "\$2"
+# qdyn exits non-zero on abnormal termination; exiting 0 keeps mpirun from killing the sibling
+# switches. The "terminated normally" count below decides whether the replicate is usable.
+$qdyn "\$1" > "\$2" || true
 EOF
 chmod +x neq_launch.sh
 
@@ -163,8 +165,8 @@ for (( off=0; off<nsw; off+=ncores )); do
     time mpirun -x BATCH_OFFSET $mpi_map -np $np ./neq_launch.sh || true
 done
 
-# qdyn's serial abort still exits 0, so a completed run is confirmed by "terminated normally" in
-# its log, not by the exit code.
+# neq_launch.sh masks qdyn's exit code (see above), so a completed run is confirmed by
+# "terminated normally" in its log, not by the exit code.
 
 # Equilibration must finish in full -- with no eq6 checkpoint there is nothing to switch from.
 eq_bad=""
