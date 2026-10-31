@@ -180,6 +180,22 @@ def test_neq_runfile_parallelizes_switches(tmp_path):
     assert "qfep" not in script  # NEQ uses BAR, not the windowed qfep step
 
 
+def test_a_crashed_switch_does_not_abort_its_siblings(tmp_path):
+    """qdyn exits non-zero on a crash; the launcher must exit 0 or mpirun kills every other switch.
+
+    Partial loss is tolerated by design: the "terminated normally" count decides the replicate.
+    """
+    run = make_run()
+    run.write_MD_neq(str(tmp_path), 10, 12, [(1, 2)])
+    run.write_neq_runfile(str(tmp_path), [])
+    script = (tmp_path / "runSNELLIUS.sh").read_text()
+    start = script.index("cat > neq_launch.sh <<EOF")
+    launcher = script[start : script.index("\nEOF\n", start)]
+    switch_line = [line for line in launcher.splitlines() if line.startswith("$qdyn ")]
+    assert switch_line == ['$qdyn "\\$1" > "\\$2" || true']
+    assert "switches lost (tolerated)" in script
+
+
 def test_neq_cores_floor_at_cluster_default_when_switches_fit(tmp_path):
     """When the billed core count already holds every switch, NTASKS stays at the cluster default
     (SNELLIUS bills 16) so the 2*neq_reps switches run in one concurrent wave and equilibration
