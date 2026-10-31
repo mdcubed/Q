@@ -10,7 +10,7 @@ from typing import Optional
 from QligFEP import __version__
 
 from ..logger import logger, setup_logger
-from ..qresfep import QRESFEP_FORCE_FIELD, QresFEP
+from ..qresfep import QRESFEP_FORCE_FIELD, QRESFEP_FORCE_FIELDS, QresFEP
 from ..resfep_protocols import DEFAULT_PRODUCTION_STEPS, apply_manuscript_settings
 from ..settings.settings import CLUSTER_DICT
 
@@ -76,10 +76,10 @@ def parse_arguments() -> argparse.Namespace:
         "--forcefield",
         dest="force_field",
         default=QRESFEP_FORCE_FIELD,
-        choices=[QRESFEP_FORCE_FIELD],
+        choices=list(QRESFEP_FORCE_FIELDS),
         help=(
-            "Force field, which must match the one used for `qprep_prot`. QresFEP currently "
-            f"supports only {QRESFEP_FORCE_FIELD}."
+            "Force field, which must match the one used for `qprep_prot`: "
+            f"{', '.join(QRESFEP_FORCE_FIELDS)}. Defaults to {QRESFEP_FORCE_FIELD}."
         ),
     )
     optional.add_argument(

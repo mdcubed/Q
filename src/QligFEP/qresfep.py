@@ -52,10 +52,26 @@ from .templates import (
     render_qprep_resfep_input,
 )
 
-#: The only force field whose residue parameters the current hybrid construction supports.
-#: TODO: Derive glycine CA/HA charges, types, and atom names from the selected libraries
-#: before widening QresFEP support to other force fields.
-QRESFEP_FORCE_FIELD = "OPLSAAM"
+#: Force fields the hybrid construction supports. Backbone charges, glycine CA/HA charges and
+#: types are read from the selected library. The first entry, the force field of the published
+#: QresFEP-2 protocol, is the default.
+QRESFEP_FORCE_FIELDS = ("OPLSAAM", "AMBER14sb")
+QRESFEP_FORCE_FIELD = QRESFEP_FORCE_FIELDS[0]
+
+#: Residue and atom names of the reference-peptide caps where a library differs from the
+#: OPLSAAM names the templates use.
+_CAP_NAMES = {
+    "AMBER14sb": {
+        "ACE": ("ACE", {"HH31": "H1", "HH32": "H2", "HH33": "H3"}),
+        "NMA": ("NME", {"CA": "C", "HA1": "H1", "HA2": "H2", "HA3": "H3"}),
+    },
+}
+
+#: Chloride residue name of each library (sodium is SOD in both).
+_CHLORIDE = {"OPLSAAM": "CLA", "AMBER14sb": "CHL"}
+
+#: Ghost type of the FEP files, for libraries whose .prm does not define one.
+_DUMMY_TYPE = ("DUM", "0.0000", "0.0000", "0.0000", "0.0000", "1.0080")
 
 #: The two stages of a dual-topology mutation, in the order they must run.
 FEP_STAGES = ("FEP1.fep", "FEP2.fep")
@@ -74,14 +90,6 @@ SOFTCORE_MAX_POTENTIAL = "20"
 RESTRAINT_LOW = 0.0
 RESTRAINT_HIGH = 0.5
 RESTRAINT_FORCE = 10.0
-
-#: Alpha-carbon charges the OPLS libraries give glycine and every other residue.
-#: A mutation to or from glycine moves CA between the two, in whichever stage
-#: also handles that residue's HA atoms.
-_CA_CHARGE_GLY = "0.080"
-_CA_CHARGE_NON_GLY = "0.140"
-_HA_CHARGE = "0.060"
-_HA_TYPE = "H140"
 
 #: Residues qprep adds as solvent, after the solute it was given.
 _SOLVENT_RESIDUES = frozenset({"HOH", "SOL", "WAT"})
@@ -204,10 +212,9 @@ class QresFEP:
         self.chain = chain
         self.system = system
         self.force_field = force_field
-        if self.force_field != QRESFEP_FORCE_FIELD:
+        if self.force_field not in QRESFEP_FORCE_FIELDS:
             raise MutationError(
-                f"QresFEP currently supports only {QRESFEP_FORCE_FIELD}, got "
-                f"{self.force_field!r}"
+                f"QresFEP supports {', '.join(QRESFEP_FORCE_FIELDS)}, got {self.force_field!r}"
             )
         self.cluster = cluster
         self.windows = int(windows)
@@ -242,6 +249,8 @@ class QresFEP:
         self.pdb: dict[int, list] = {}
         self.atom_ids: dict[str, str] = {}
         self.merged_lib: dict[str, list[str]] = {}
+        #: Backbone atom -> (wild-type charge, mutant charge), from the library.
+        self.backbone_charges: dict[str, tuple[str, str]] = {}
         self.zero_force: dict[str, list[str]] = {}
         self.anchor_atom: int | None = None
         self.counter_ions = 0
@@ -503,11 +512,20 @@ class QresFEP:
             if residue not in entries:
                 raise MutationError(f"{residue} has no entry in {Path(lib_path).name}")
 
+        atoms = {residue: self._library_atoms(entries[residue]) for residue in (self.wild_type, self.mutant)}
+        self.backbone_charges = {
+            name: (atoms[self.wild_type][name][1], atoms[self.mutant][name][1])
+            for name in self.backbone
+            if name in atoms[self.wild_type] and name in atoms[self.mutant]
+        }
+        # Glycine's alpha carbon may carry its own type (OPLS-AA/M); the hybrid always
+        # has a side chain, so it takes the mutant's.
+        ca_type = atoms[self.mutant]["CA"][0] if self.from_gly else None
+
         header = None
         for line in entries[self.wild_type]:
-            # Glycine's alpha carbon carries its own type; the hybrid always has a
-            # side chain, so it takes the general one.
-            line = line.replace("C223", "C224")
+            if ca_type is not None and header == "[atoms]":
+                line = re.sub(r"^(\s*\d+\s+CA\s+)\S+", lambda match: match.group(1) + ca_type, line)
             if any(line.lstrip().startswith(candidate) for candidate in headers):
                 header = line.strip().split()[0]
                 self.merged_lib[header] = []
@@ -554,6 +572,18 @@ class QresFEP:
                         out.write(f"    {index:2d} {tokens[1]:<10}{tokens[2]:<10}{tokens[3]:<10}\n")
                     else:
                         out.write(line)
+
+    @staticmethod
+    def _library_atoms(entry: list[str]) -> dict[str, tuple[str, str]]:
+        """Atom name -> (type, charge) from the [atoms] section of a raw library entry."""
+        atoms, section = {}, None
+        for line in entry:
+            tokens = line.split()
+            if tokens and tokens[0].startswith("["):
+                section = tokens[0]
+            elif section == "[atoms]" and len(tokens) >= 4 and tokens[0].isdigit():
+                atoms[tokens[1]] = (tokens[2], tokens[3])
+        return atoms
 
     @staticmethod
     def _read_library_entries(lib_path: Path, wanted: set[str]) -> dict[str, list[str]]:
@@ -698,9 +728,14 @@ class QresFEP:
         except PeptideBuildError as error:
             raise MutationError(str(error)) from error
 
+        renames = _CAP_NAMES.get(self.force_field, {})
         serial = itertools.count(1)
         for atom in peptide:
             atom[1] = next(serial)
+            if atom[4] in renames:  # the cap templates carry OPLSAAM names
+                residue_name, atom_names = renames[atom[4]]
+                atom[2] = atom_names.get(atom[2], atom[2])
+                atom[4] = residue_name
 
         self.system_size = len(peptide)
         complex_pdb = self.inputfiles / "complex.pdb"
@@ -737,7 +772,7 @@ class QresFEP:
         # Kept clear of the boundary shell, where the radial restraints act.
         placement_radius = int(self.radius) - 11
         positions = minimize_coulomb_on_sphere(abs(charge), placement_radius, self.center)
-        ion = "CLA" if charge < 0 else "SOD"
+        ion = _CHLORIDE[self.force_field] if charge < 0 else "SOD"
         serial = first_free_serial
         for residue, (x, y, z) in enumerate(positions, start=6):
             serial += 1
@@ -1100,13 +1135,14 @@ class QresFEP:
             lines.append(f"{index:4d}{first:>10s}{second:>10s}")
 
         lines += ["", "[atom_types]"]
-        for entry in vdw_parameters:
-            tokens = entry.split()
-            if len(tokens) >= 7:
-                lines.append(
-                    f"{tokens[0]:<8s}{tokens[1]:>10s}{tokens[3]:>10s}  0.0  0.0"
-                    f"{tokens[4]:>10s}{tokens[5]:>10s}{tokens[6]:>10s}"
-                )
+        types = [entry.split() for entry in vdw_parameters if len(entry.split()) >= 7]
+        if not any(tokens[0] == _DUMMY_TYPE[0] for tokens in types):  # e.g. AMBER14sb.prm
+            types.append([_DUMMY_TYPE[0], _DUMMY_TYPE[1], "0.0", *_DUMMY_TYPE[2:]])
+        for tokens in types:
+            lines.append(
+                f"{tokens[0]:<8s}{tokens[1]:>10s}{tokens[3]:>10s}  0.0  0.0"
+                f"{tokens[4]:>10s}{tokens[5]:>10s}{tokens[6]:>10s}"
+            )
 
         lines += ["", "[change_atoms]"]
         for index, entry in enumerate(self.merged_lib["[atoms]"], start=1):
@@ -1145,37 +1181,29 @@ class QresFEP:
         """Return one hybrid atom's charge in both states of a stage."""
         if name.islower():  # mutant side chain: charged in stage 2
             if self.from_gly and name == "ha":
-                return ("0.000", _HA_CHARGE) if is_first_stage else (_HA_CHARGE, _HA_CHARGE)
+                return ("0.000", charge) if is_first_stage else (charge, charge)
             return ("0.000", "0.000") if is_first_stage else ("0.000", charge)
 
         # wild-type side chain: discharged in stage 1
         if self.to_gly and name == "HA":
-            return (_HA_CHARGE, _HA_CHARGE) if is_first_stage else (_HA_CHARGE, "0.000")
+            return (charge, charge) if is_first_stage else (charge, "0.000")
         if name in self.backbone:
-            if name == "CA" and self.from_gly:
-                return (
-                    (_CA_CHARGE_GLY, _CA_CHARGE_NON_GLY)
-                    if is_first_stage
-                    else (_CA_CHARGE_NON_GLY, _CA_CHARGE_NON_GLY)
-                )
-            if name == "CA" and self.to_gly:
-                return (
-                    (_CA_CHARGE_NON_GLY, _CA_CHARGE_NON_GLY)
-                    if is_first_stage
-                    else (_CA_CHARGE_NON_GLY, _CA_CHARGE_GLY)
-                )
-            return (charge, charge)  # the backbone is shared and never perturbed
+            # The shared backbone takes the mutant's charges in the stage that also handles the
+            # glycine HA atoms (stage 2, or stage 1 out of glycine, whose stages run swapped). In
+            # OPLS-AA/M only CA next to glycine differs; ff14SB backbone charges are per residue.
+            wild_type, mutant = self.backbone_charges.get(name, (charge, charge))
+            if self.from_gly:
+                return (wild_type, mutant) if is_first_stage else (mutant, mutant)
+            return (wild_type, wild_type) if is_first_stage else (wild_type, mutant)
         return (charge, "0.000") if is_first_stage else ("0.000", "0.000")
 
     def _type_pair(self, name: str, atom_type: str, is_first_stage: bool) -> tuple[str, str]:
         """Return one hybrid atom's type in both states of a stage."""
-        if name.islower():  # mutant side chain: grown in during stage 2
-            if self.from_gly and name == "ha":
-                return ("DUM", _HA_TYPE) if is_first_stage else (_HA_TYPE, _HA_TYPE)
+        if name.islower():  # mutant side chain (glycine's ha included): grown in during stage 2
             return ("DUM", atom_type) if is_first_stage else (atom_type, atom_type)
 
         if self.to_gly and name == "HA":
-            return (_HA_TYPE, _HA_TYPE) if is_first_stage else (_HA_TYPE, "DUM")
+            return (atom_type, atom_type) if is_first_stage else (atom_type, "DUM")
         if name in self.backbone:
             return (atom_type, atom_type)
         return (atom_type, atom_type) if is_first_stage else (atom_type, "DUM")

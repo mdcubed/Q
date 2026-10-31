@@ -336,16 +336,28 @@ class TestCofactorsInTheComplex:
 
 
 class TestForceFieldSupport:
-    def test_non_oplsaam_force_fields_are_rejected(self, tmp_path):
-        with pytest.raises(MutationError, match="currently supports only OPLSAAM"):
+    @pytest.mark.parametrize("force_field", ["OPLS2015", "CHARMM36"])
+    def test_unsupported_force_fields_are_rejected(self, tmp_path, force_field):
+        with pytest.raises(MutationError, match="QresFEP supports OPLSAAM, AMBER14sb"):
             QresFEP(
                 mutation="LEU1ALA",
                 chain="A",
                 system="protein",
-                force_field="AMBER14sb",
+                force_field=force_field,
                 cluster="SNELLIUS",
                 workdir=tmp_path,
             )
+
+    def test_amber14sb_is_accepted(self, tmp_path):
+        run = QresFEP(
+            mutation="LEU1ALA",
+            chain="A",
+            system="protein",
+            force_field="AMBER14sb",
+            cluster="SNELLIUS",
+            workdir=tmp_path,
+        )
+        assert run.force_field == "AMBER14sb"
 
     def test_preparation_force_field_must_match_setup(self, tmp_path):
         SpherePrep(
@@ -367,6 +379,105 @@ class TestForceFieldSupport:
 
         with pytest.raises(MutationError, match="sphere was prepared with OPLS2015"):
             run.read_prep()
+
+
+def _hybrid(tmp_path, mutation, force_field):
+    """A QresFEP run whose hybrid library has been written from the real force-field library."""
+    run = QresFEP(
+        mutation=mutation,
+        chain="A",
+        system="protein",
+        force_field=force_field,
+        cluster="SNELLIUS",
+        workdir=tmp_path,
+    )
+    run.inputfiles.mkdir(parents=True)
+    run.write_hybrid_lib()
+    return run
+
+
+def _charges(run, name):
+    """(stage 1 pair, stage 2 pair) of one hybrid atom, with the charge its library entry gives it."""
+    charge = next(entry.split()[3] for entry in run.merged_lib["[atoms]"] if entry.split()[1] == name)
+    return run._charge_pair(name, charge, True), run._charge_pair(name, charge, False)
+
+
+class TestBackboneChargesFromTheLibrary:
+    """Backbone charges come from the library, so OPLS-AA/M keeps its old values and ff14SB is right."""
+
+    def test_oplsaam_backbone_is_untouched_between_non_glycine_residues(self, tmp_path):
+        run = _hybrid(tmp_path, "LEU1ALA", "OPLSAAM")
+        for name in ("N", "H", "CA", "HA", "C", "O"):
+            stage1, stage2 = _charges(run, name)
+            assert stage1[0] == stage1[1] == stage2[0] == stage2[1]
+
+    def test_oplsaam_glycine_ca_charges_are_the_published_ones(self, tmp_path):
+        out_of_gly = _hybrid(tmp_path / "g2a", "GLY1ALA", "OPLSAAM")
+        assert _charges(out_of_gly, "CA") == (("0.080", "0.140"), ("0.140", "0.140"))
+        into_gly = _hybrid(tmp_path / "a2g", "ALA1GLY", "OPLSAAM")
+        assert _charges(into_gly, "CA") == (("0.140", "0.140"), ("0.140", "0.080"))
+        assert _charges(into_gly, "HA") == (("0.060", "0.060"), ("0.060", "0.000"))
+
+    def test_oplsaam_glycine_ca_takes_the_side_chain_type(self, tmp_path):
+        run = _hybrid(tmp_path, "GLY1ALA", "OPLSAAM")
+        ca = next(entry.split() for entry in run.merged_lib["[atoms]"] if entry.split()[1] == "CA")
+        assert ca[2] == "C224"
+
+    def test_amber14sb_backbone_moves_to_the_mutant_charges_in_stage_2(self, tmp_path):
+        run = _hybrid(tmp_path, "SER1ALA", "AMBER14sb")
+        assert run.backbone_charges["CA"] == ("-0.024900", "0.033700")
+        assert _charges(run, "CA") == (("-0.024900", "-0.024900"), ("-0.024900", "0.033700"))
+        assert _charges(run, "HA") == (("0.084300", "0.084300"), ("0.084300", "0.082300"))
+
+    def test_amber14sb_end_states_carry_whole_residue_charges(self, tmp_path):
+        """Stage 1 starts as Ser and stage 2 ends as Ala, each with the library's integer net charge."""
+        run = _hybrid(tmp_path, "SER1ALA", "AMBER14sb")
+        start = end = 0.0
+        for entry in run.merged_lib["[atoms]"]:
+            stage1, stage2 = _charges(run, entry.split()[1])
+            start += float(stage1[0])
+            end += float(stage2[1])
+        assert start == pytest.approx(0.0, abs=1e-4)
+        assert end == pytest.approx(0.0, abs=1e-4)
+
+
+class TestAmber14sbFepAndPeptide:
+    def test_fep_files_define_the_dummy_type(self, tmp_path):
+        run = _hybrid(tmp_path, "SER1ALA", "AMBER14sb")
+        run.pdb = {1: []}
+        run.q_position = 1
+        run.atom_ids = {}
+        content = run._render_fep_file(True, ["CX  1.908  0.0  0.1094  1.908  0.0547  12.01\n"])
+        atom_types = content.split("[atom_types]")[1].split("[change_atoms]")[0]
+        assert any(line.split()[:1] == ["DUM"] for line in atom_types.splitlines())
+
+    def test_reference_peptide_caps_use_amber_names(self, tmp_path):
+        protein = tmp_path / "protein_processed.pdb"
+        protein.write_text(_LEU1)
+        (tmp_path / "ALA1.pdb").write_text(_LEU1.replace("LEU", "ALA"))
+        run = QresFEP(
+            mutation="LEU1ALA",
+            chain="A",
+            system="tripeptide",
+            force_field="AMBER14sb",
+            cluster="SNELLIUS",
+            workdir=tmp_path,
+        )
+        run.protein_pdb = protein
+        run.q_position = 1
+        run.read_pdb()
+        run.inputfiles.mkdir(parents=True)
+
+        run._write_reference_peptide()
+
+        complex_pdb = (run.inputfiles / "complex.pdb").read_text()
+        records = [line for line in complex_pdb.splitlines() if line.startswith("ATOM")]
+        residues = {line[17:20] for line in records}
+        assert "NME" in residues and "NMA" not in residues
+        nme = {line[12:16].strip() for line in records if line[17:20] == "NME"}
+        ace = {line[12:16].strip() for line in records if line[17:20] == "ACE"}
+        assert nme == {"N", "H", "C", "H1", "H2", "H3"}
+        assert {"H1", "H2", "H3", "CH3"} <= ace
 
 
 class TestProductionSteps:

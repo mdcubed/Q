@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Optional
 
 from ..logger import logger, setup_logger
-from ..qresfep import QRESFEP_FORCE_FIELD
+from ..qresfep import QRESFEP_FORCE_FIELD, QRESFEP_FORCE_FIELDS
 from ..resfep_protocols import DEFAULT_PRODUCTION_STEPS, apply_manuscript_settings
 from ..resfep_setup import Mutation, MutationSeries, SetupError, read_mutations
 from ..settings.settings import CLUSTER_DICT
@@ -113,10 +113,10 @@ def parse_arguments() -> argparse.Namespace:
         "--forcefield",
         dest="force_field",
         default=QRESFEP_FORCE_FIELD,
-        choices=[QRESFEP_FORCE_FIELD],
+        choices=list(QRESFEP_FORCE_FIELDS),
         help=(
-            "Force field for both preparation and setup. QresFEP currently supports only "
-            f"{QRESFEP_FORCE_FIELD}."
+            f"Force field for both preparation and setup: {', '.join(QRESFEP_FORCE_FIELDS)}. "
+            f"Defaults to {QRESFEP_FORCE_FIELD}, the force field of the published protocol."
         ),
     )
     optional.add_argument(
